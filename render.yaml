@@ -1,7 +1,14 @@
 services:
   - type: web
-    name: yolo-streamlit-skin-detector
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: streamlit run app.py --server.enableCORS false --server.enableXsrfProtection false --server.port 10000 --server.address 0.0.0.0
+    name: yolov8-detection-app
+    runtime: docker
     plan: free
+    repo: https://github.com/yourusername/yolov8-detection-app  # Ganti dengan URL repo GitHub Anda
+    branch: main
+    buildCommand: docker build -t yolov8-detection-app .
+    startCommand: gunicorn --worker-class eventlet -w 1 -b 0.0.0.0:$PORT app:app
+    envVars:
+      - key: MODEL_PATH
+        value: models/my_model1.pt
+    healthCheckPath: /
+    autoDeploy: true
