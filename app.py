@@ -1,117 +1,122 @@
-import streamlit as st
-import av
+import os
+import sys
+import time
 import cv2
 import numpy as np
+from flask import Flask, render_template, Response, request, jsonify
+from flask_socketio import SocketIO
+from werkzeug.utils import secure_filename
 from ultralytics import YOLO
-from PIL import Image
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
-import time
+import base64
+import uuid
 
-# Config
-st.set_page_config(page_title="YOLOv8 Streamlit Detector", layout="centered")
-CLASSES = ['Acne', 'Moles', 'Sun_Sunlight_Damage', 'Infestations_Bites']
-model_path = "my_model1.pt"
-model = YOLO(model_path)
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'ultrayolo123'
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload
+socketio = SocketIO(app)
 
-# Custom style + full screen video
-st.markdown("""
-    <style>
-    html, body {
-        background-color: #f5f7fa;
-    }
-    h1 {
-        text-align: center;
-        color: #2E8B57;
-    }
-    video {
-        width: 100% !important;
-        height: 80vh !important;
-        object-fit: cover;
-        border-radius: 12px;
-        box-shadow: 0 0 10px rgba(0,0,0,0.3);
-    }
-    @media (prefers-color-scheme: dark) {
-        html, body {
-            background-color: #1e1e1e;
-            color: #ffffff;
-        }
-        h1 {
-            color: #90ee90 !important;
-        }
-    }
-    </style>
-""", unsafe_allow_html=True)
+# Create upload folder if it doesn't exist
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-st.markdown("<h1>🧬 YOLOv8 Skin Detector</h1>", unsafe_allow_html=True)
-st.write("---")
+# Set default model path - make sure to place your model file in this directory
+DEFAULT_MODEL_PATH = os.environ.get('MODEL_PATH', 'models/yolov8n.pt')
 
-tab1, tab2 = st.tabs(["📷 Kamera", "🖼️ Upload Gambar"])
+# Global variables
+model = None
+camera = None
+is_running = False
+bbox_colors = [(164,120,87), (68,148,228), (93,97,209), (178,182,133), (88,159,106), 
+              (96,202,231), (159,124,168), (169,162,241), (98,118,150), (172,176,184)]
 
-# =============== Webcam Processor ===============
-class YOLOProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.fps_window = []
-        self.start_time = time.perf_counter()
+def load_model(model_path=DEFAULT_MODEL_PATH):
+    """Load the YOLO model"""
+    global model
+    try:
+        # Make sure the models directory exists
+        os.makedirs('models', exist_ok=True)
+        
+        # If model doesn't exist, download the default YOLOv8n model
+        if not os.path.exists(model_path):
+            print(f"Model {model_path} not found. Downloading default YOLOv8n model...")
+            from ultralytics import YOLO
+            model = YOLO('yolov8n.pt')
+            model.save('models/yolov8n.pt')
+        else:
+            model = YOLO(model_path, task='detect')
+        
+        return True
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        return False
 
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        t0 = time.perf_counter()
+def detect_objects(frame, min_confidence=0.5):
+    """Run object detection on a single frame"""
+    global model
+    
+    if model is None:
+        load_model()
+    
+    # Run inference
+    results = model(frame, verbose=False)
+    detections = results[0].boxes
+    
+    # Create a copy of the frame to draw on
+    output_frame = frame.copy()
+    
+    # Object count for statistics
+    object_counts = {}
+    
+    # Process detections
+    for i in range(len(detections)):
+        # Get bounding box coordinates
+        xyxy_tensor = detections[i].xyxy.cpu()
+        xyxy = xyxy_tensor.numpy().squeeze()
+        xmin, ymin, xmax, ymax = xyxy.astype(int)
+        
+        # Get class ID and name
+        classidx = int(detections[i].cls.item())
+        classname = model.names[classidx]
+        
+        # Get confidence
+        conf = detections[i].conf.item()
+        
+        # Draw box if confidence is high enough
+        if conf > min_confidence:
+            color = bbox_colors[classidx % 10]
+            cv2.rectangle(output_frame, (xmin, ymin), (xmax, ymax), color, 2)
+            
+            # Add label
+            label = f'{classname}: {int(conf*100)}%'
+            labelSize, baseLine = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            label_ymin = max(ymin, labelSize[1] + 10)
+            cv2.rectangle(output_frame, (xmin, label_ymin-labelSize[1]-10), 
+                         (xmin+labelSize[0], label_ymin+baseLine-10), color, cv2.FILLED)
+            cv2.putText(output_frame, label, (xmin, label_ymin-7), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            
+            # Update object count
+            if classname in object_counts:
+                object_counts[classname] += 1
+            else:
+                object_counts[classname] = 1
+    
+    return output_frame, object_counts
 
-        results = model(img)[0]
-        object_count = 0
-
-        for r in results.boxes:
-            cls_id = int(r.cls[0])
-            label = CLASSES[cls_id] if cls_id < len(CLASSES) else f"class {cls_id}"
-            conf = float(r.conf[0])
-            xyxy = r.xyxy[0].cpu().numpy().astype(int)
-            if conf > 0.5:
-                object_count += 1
-                cv2.rectangle(img, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), (0, 255, 0), 2)
-                cv2.putText(img, f"{label}: {int(conf*100)}%", (xyxy[0], xyxy[1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-        fps = 1.0 / (time.perf_counter() - t0)
-        self.fps_window.append(fps)
-        if len(self.fps_window) > 30:
-            self.fps_window.pop(0)
-
-        avg_fps = sum(self.fps_window) / len(self.fps_window)
-        cv2.putText(img, f'FPS: {avg_fps:.2f}', (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-        cv2.putText(img, f'Objects: {object_count}', (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-# =============== TAB 1: Webcam ===============
-with tab1:
-    st.info("Berikan izin kamera dan gunakan browser modern (Chrome/Edge/Firefox)")
-    webrtc_streamer(
-        key="webcam-yolo",
-        video_processor_factory=YOLOProcessor,
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=True,
-    )
-
-# =============== TAB 2: Upload Image ===============
-with tab2:
-    uploaded = st.file_uploader("Unggah gambar (jpg, png)", type=["jpg", "jpeg", "png"])
-    if uploaded:
-        img = Image.open(uploaded).convert("RGB")
-        img_np = np.array(img)
-        results = model(img_np)[0]
-
-        object_count = 0
-        for r in results.boxes:
-            cls_id = int(r.cls[0])
-            label = CLASSES[cls_id] if cls_id < len(CLASSES) else f"class {cls_id}"
-            conf = float(r.conf[0])
-            xyxy = r.xyxy[0].cpu().numpy().astype(int)
-            if conf > 0.5:
-                object_count += 1
-                cv2.rectangle(img_np, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), (255, 0, 0), 2)
-                cv2.putText(img_np, f"{label}: {int(conf*100)}%", (xyxy[0], xyxy[1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-
-        st.image(img, caption=f"Hasil Deteksi ({object_count} objek)", use_column_width=True)
+def process_webcam():
+    """Generator function for webcam frames"""
+    global camera, is_running
+    
+    if camera is None:
+        try:
+            camera = cv2.VideoCapture(0)
+        except Exception as e:
+            print(f"Error opening camera: {e}")
+            yield None
+            return
+    
+    fps_buffer = []
+    start_time = time.time()
+    
+    while is_running:
+        success, frame = camera.read()
